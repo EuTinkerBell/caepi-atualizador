@@ -37,7 +37,15 @@ URLS_PADRAO = [
 ]
 
 # Nomes (já normalizados) que podem identificar a coluna do número do CA.
-CANDIDATOS_CHAVE = ["registroca", "ca", "nrca", "numeroca", "numero_ca", "nr_ca", "registro_ca"]
+CANDIDATOS_CHAVE = [
+    "nrregistroca", "registroca", "ca", "nrca", "numeroca", "numero_ca", "nr_ca", "registro_ca", "nr_registro_ca",
+]
+DELIMITADORES = ";|\t,"  # o arquivo oficial atual usa ponto e vírgula; o antigo usava barra vertical
+
+
+def e_chave(nome):
+    """True se o nome (já normalizado) parece ser o da coluna do número do CA."""
+    return nome in CANDIDATOS_CHAVE or nome.endswith("registroca") or nome.endswith("registro_ca")
 
 # Se o arquivo novo tiver menos que esta fração dos registros atuais, a
 # atualização é abortada (protege contra download cortado ou arquivo errado).
@@ -76,13 +84,19 @@ def extrair_texto(conteudo):
             nomes = [n for n in z.namelist() if not n.endswith("/")]
             if not nomes:
                 raise ValueError("O .zip está vazio")
-            preferidos = [n for n in nomes if n.lower().endswith((".csv", ".txt"))]
-            nome = (preferidos or nomes)[0]
+            tamanhos = {i.filename: i.file_size for i in z.infolist() if not i.filename.endswith("/")}
+            log.info("Arquivos no zip: %s", ", ".join("%s (%d bytes)" % (n, t) for n, t in tamanhos.items()))
+            nome = max(nomes, key=lambda n: tamanhos[n])  # a base de dados é o maior arquivo
             log.info("Lendo '%s' de dentro do zip", nome)
             conteudo = z.read(nome)
-    for enc in ("utf-8-sig", "latin-1"):
+    if conteudo.startswith((b"\xff\xfe", b"\xfe\xff")):
+        log.info("Codificação detectada: utf-16")
+        return conteudo.decode("utf-16")
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):  # o tutorial oficial indica Windows-1252
         try:
-            return conteudo.decode(enc)
+            texto = conteudo.decode(enc)
+            log.info("Codificação detectada: %s", enc)
+            return texto
         except UnicodeDecodeError:
             continue
     raise ValueError("Não consegui decodificar o arquivo")
@@ -94,21 +108,49 @@ def normalizar(nome):
     return re.sub(r"[^0-9a-zA-Z]+", "_", nome).strip("_").lower()
 
 
+def _achar_cabecalho(linhas):
+    """Procura o cabeçalho nas primeiras linhas. Devolve (indice_da_linha, separador)."""
+    melhor, vistas = None, 0  # melhor = (n_campos, indice, separador)
+    for i, linha in enumerate(linhas[:60]):
+        if not linha.strip():
+            continue
+        vistas += 1
+        for d in DELIMITADORES:
+            campos = linha.split(d)
+            if len(campos) < 2:
+                continue
+            if any(e_chave(normalizar(c)) for c in campos):
+                return i, d
+            if vistas <= 5 and (melhor is None or len(campos) > melhor[0]):
+                melhor = (len(campos), i, d)
+    if melhor and melhor[0] >= 3:
+        log.warning("Não achei coluna de CA no cabeçalho; usando a linha %d como cabeçalho", melhor[1] + 1)
+        return melhor[1], melhor[2]
+    amostra = [repr(l[:200]) for l in linhas if l.strip()][:3]
+    raise ValueError(
+        "Não identifiquei o cabeçalho nem o separador de colunas. Primeiras linhas do arquivo: " + " || ".join(amostra)
+    )
+
+
 def interpretar(texto):
     """Devolve (colunas_normalizadas, lista_de_linhas)."""
     linhas_texto = texto.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    while linhas_texto and not linhas_texto[0].strip():
-        linhas_texto.pop(0)
-    if not linhas_texto:
+    if not any(l.strip() for l in linhas_texto):
         raise ValueError("Arquivo sem conteúdo")
 
-    cab = linhas_texto[0]
-    delim = max("|;\t,", key=cab.count)
-    if cab.count(delim) == 0:
-        raise ValueError("Não identifiquei o separador de colunas no cabeçalho")
+    i0, delim = _achar_cabecalho(linhas_texto)
+    if i0:
+        log.info("Ignorando %d linha(s) antes do cabeçalho", i0)
+    resto = linhas_texto[i0:]
 
-    # QUOTE_NONE: o arquivo oficial não usa aspas para proteger campos.
-    leitor = csv.reader(linhas_texto, delimiter=delim, quoting=csv.QUOTE_NONE)
+    # Campos entre aspas (padrão do Excel) ou sem aspas (formato antigo do CAEPI)?
+    amostra = [l for l in resto[1:41] if l.strip()]
+    entre_aspas = bool(amostra) and sum(1 for l in amostra if l.startswith('"') or (delim + '"') in l) >= len(amostra) / 2
+    if entre_aspas:
+        log.info("Campos entre aspas detectados")
+        leitor = csv.reader(io.StringIO("\n".join(resto), newline=""), delimiter=delim)
+    else:
+        leitor = csv.reader(resto, delimiter=delim, quoting=csv.QUOTE_NONE)
     cabecalho = next(leitor)
 
     colunas, usados = [], set()
@@ -139,18 +181,19 @@ def interpretar(texto):
                 malformadas += 1
                 continue
             row = row[:n]
-        linhas.append([x.strip() for x in row])
+        linhas.append([x.replace("\n", " ").strip() for x in row])
     if pendente is not None:
         malformadas += 1
     if malformadas:
         log.warning("%d linha(s) fora do padrão foram ignoradas", malformadas)
+    log.info("Colunas encontradas: %s", ", ".join(colunas))
     return colunas, linhas
 
 
 def achar_chave(colunas):
-    for cand in CANDIDATOS_CHAVE:
-        if cand in colunas:
-            return colunas.index(cand)
+    for i, c in enumerate(colunas):
+        if e_chave(c):
+            return i
     raise ValueError("Não achei a coluna do número do CA. Colunas do arquivo: %s" % ", ".join(colunas))
 
 
