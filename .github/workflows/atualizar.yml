@@ -1,0 +1,36 @@
+name: Atualizar CAEPI
+
+on:
+  schedule:
+    # O cron do GitHub usa UTC. 01:17 UTC = 22:17 em Brasília.
+    # Horário "quebrado" de propósito: no topo da hora o GitHub atrasa ou descarta execuções.
+    - cron: "17 1 * * *"
+    # Segunda execução de reserva (01:43 em Brasília). É inofensiva: se nada mudou, não altera nada.
+    - cron: "43 4 * * *"
+  workflow_dispatch: # permite rodar na mão pela aba Actions
+
+concurrency:
+  group: atualizar-caepi
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  atualizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Atualizar banco de CAs
+        run: python caepi_nuvem.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
